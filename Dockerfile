@@ -1,7 +1,7 @@
 #
 # Define a base image with all our build dependencies.
 #
-FROM debian:bullseye-slim as build
+FROM debian:trixie-slim as build
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -14,6 +14,7 @@ RUN apt-get update \
     libpam-dev \
     zlib1g-dev \
     liblz4-dev \
+    libzstd-dev \
 	libxml2-dev \
     libxslt1-dev \
     libselinux1-dev \
@@ -30,6 +31,7 @@ RUN apt-get update \
     postgresql-common \
     libpq5 \
     libpq-dev \
+    libzstd1 \
     postgresql-server-dev-all \
     postgresql-common \
     postgresql-client-common \
@@ -42,7 +44,7 @@ WORKDIR /usr/src/pgcopydb
 
 COPY Makefile ./
 COPY GIT-VERSION-GEN ./
-COPY version ./
+# COPY version ./
 COPY ./src/ ./src
 
 RUN make -s clean && make -s -j8 install
@@ -50,7 +52,7 @@ RUN make -s clean && make -s -j8 install
 #
 # Now the "run" image, as small as possible
 #
-FROM debian:bullseye-slim as run
+FROM debian:trixie-slim as run
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -63,12 +65,7 @@ RUN apt-get update \
     psutils \
     libpq5 \
     postgresql-client-common \
-    postgresql-client-13 \
+    postgresql-client-15 \
 	&& rm -rf /var/lib/apt/lists/*
 
-RUN adduser --disabled-password --gecos '' --home /var/lib/postgres docker
-RUN adduser docker sudo
-
-COPY --from=build /usr/lib/postgresql/13/bin/pgcopydb /usr/local/bin
-
-USER docker
+COPY --from=build /usr/lib/postgresql/15/bin/pgcopydb /usr/local/bin

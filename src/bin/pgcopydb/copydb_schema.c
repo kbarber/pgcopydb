@@ -333,7 +333,7 @@ copydb_prepare_table_specs(CopyDataSpec *specs, PGSQL *pgsql)
 			if (source->partsArray.count > 1)
 			{
 				log_info("Table \"%s\".\"%s\" is %s large, "
-						 "%d COPY processes will be used, partitining on \"%s\".",
+						 "%d COPY processes will be used, partitioning on \"%s\".",
 						 source->nspname,
 						 source->relname,
 						 source->bytesPretty,
