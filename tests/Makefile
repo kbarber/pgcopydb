@@ -7,7 +7,7 @@ BUILD_ARGS = --build-arg PGVERSION=$(PGVERSION)
 
 all: pagila pagila-multi-steps blobs unit filtering extensions \
 	 partitioned-target all-databases target-resume-recovery \
-	 target-connection-drop \
+	 target-connection-drop target-resume-constraint \
 	 cdc-wal2json cdc-test-decoding cdc-endpos-mid-txn cdc-low-level \
 	 cdc-replica-identity-index cdc-partitioned-target cdc-matview \
 	 cdc-endpos-in-multi-wal-txn cdc-file-rotation \
@@ -37,6 +37,9 @@ blobs: build
 	$(MAKE) -C $@
 
 target-connection-drop: build
+	$(MAKE) -C $@
+
+target-resume-constraint: build
 	$(MAKE) -C $@
 
 unit: build
@@ -152,7 +155,7 @@ clean-images:
 	-docker rmi pagila multi 2>/dev/null; true
 
 .PHONY: all build build-pagila build-multi force-build clean-images
-.PHONY: pagila pagila-multi-steps blobs unit filtering partitioned-target extensions target-resume-recovery target-connection-drop
+.PHONY: pagila pagila-multi-steps blobs unit filtering partitioned-target extensions target-resume-recovery target-connection-drop target-resume-constraint
 .PHONY: toc-coverage
 .PHONY: all-databases three-databases
 .PHONY: cdc-wal2json cdc-test-decoding cdc-endpos-mid-txn cdc-low-level cdc-replica-identity-index cdc-partitioned-target
