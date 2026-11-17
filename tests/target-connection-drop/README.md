@@ -1,19 +1,12 @@
 # target-connection-drop
 
-Reproduces the production "dropped connection" clone failure and proves the
-reconnect-and-replay fix.
+Checks that a `pgcopydb clone` survives the target database resetting its
+connections mid-clone, recovering transparently instead of aborting.
 
-In production, test forks clone into a single, undersized, burstable target
-(a `db.t4g.medium` Aurora instance). Once the clone exhausts the target's CPU
-credits and memory, the target resets pgcopydb's connections mid-clone. The
-old `--fail-fast` behaviour turned any one of those resets into a hard abort
-(`connection pointer is NULL`, `SIGTERM`, exit 12).
-
-This test recreates that condition deterministically: a background killer
-(`killer.sh`) repeatedly runs `pg_terminate_backend()` against every
-`pgcopydb%` backend on the **target** while a full `pgcopydb clone` is running.
-The dataset (`import.sql`) is sized and shaped so the clone exercises every
-reconnect-and-replay path at once:
+A background killer (`killer.sh`) repeatedly runs `pg_terminate_backend()`
+against every `pgcopydb%` backend on the **target** while a full
+`pgcopydb clone` is running. The dataset (`import.sql`) is sized and shaped so
+the clone exercises every reconnect-and-replay path at once:
 
 - table COPY (already resilient via the table-data outer retry loop)
 - CREATE INDEX workers (`indexes.c`)

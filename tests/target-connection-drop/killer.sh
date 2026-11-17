@@ -1,8 +1,7 @@
 #! /bin/bash
 #
 # Repeatedly terminate pgcopydb's backends on the TARGET database, simulating
-# the target-side connection resets seen in production (an overloaded,
-# undersized target dropping connections out from under a running clone).
+# the target dropping connections out from under a running clone.
 #
 # This script runs in the background for the whole clone and keeps killing
 # pgcopydb target backends until it is told to stop (the main script creates

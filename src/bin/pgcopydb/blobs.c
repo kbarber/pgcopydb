@@ -352,8 +352,8 @@ copydb_start_blob_workers(CopyDataSpec *specs)
  * whatever the total number of large objects.
  *
  * This wraps copydb_blob_worker_flush_batch_once with a reconnect-and-replay
- * loop: the worker holds a long-lived MULTI_STATEMENT target connection that a
- * loaded target can tear down mid-batch. Replaying the whole batch is safe
+ * loop: the worker holds a long-lived MULTI_STATEMENT target connection that
+ * the target can tear down mid-batch. Replaying the whole batch is safe
  * because each large object is copied in its own transaction and the batch
  * re-checks which objects already exist on the target (skip-or-copy), so the
  * objects committed before the drop are skipped on the retry.

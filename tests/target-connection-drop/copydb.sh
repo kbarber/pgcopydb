@@ -10,12 +10,12 @@ set -e
 #  - PGCOPYDB_TABLE_JOBS
 #  - PGCOPYDB_INDEX_JOBS
 #
-# It reproduces the production "dropped connection" failure: an undersized,
-# overloaded target that resets pgcopydb's connections mid-clone. A background
-# killer terminates pgcopydb's target backends throughout the clone; the clone
-# must still finish successfully and land identical data, proving the
-# reconnect-and-replay paths (table COPY, CREATE INDEX, sequences, blobs)
-# recover transparently instead of being torn down by --fail-fast.
+# It checks that a clone survives the target resetting its connections
+# mid-clone. A background killer terminates pgcopydb's target backends
+# throughout the clone; the clone must still finish successfully and land
+# identical data, confirming the reconnect-and-replay paths (table COPY,
+# CREATE INDEX, sequences, blobs) recover transparently instead of being
+# torn down by --fail-fast.
 
 # make sure source and target databases are ready
 pgcopydb ping
