@@ -389,8 +389,36 @@ copydb_index_worker(CopyDataSpec *specs)
 				 * after the fact -- just never leave it idle in the first
 				 * place.
 				 */
-				bool ok = pgsql_set_gucs(useDst, dstSettings) &&
-						  copydb_create_index_by_oid(useSpecs, useDst, oid);
+				/*
+				 * Build this index, reconnecting and replaying if the target
+				 * tears the connection down mid-build. pgsql_set_gucs promotes
+				 * useDst to a MULTI_STATEMENT connection, so the CREATE INDEX
+				 * runs outside the single-statement reconnect in
+				 * pgsql_execute_with_params and has to be retried here. A drop
+				 * mid-CREATE-INDEX leaves nothing committed on the server, so
+				 * replaying the whole unit is safe: we finish the broken
+				 * connection and the next pgsql_set_gucs re-opens a fresh one.
+				 */
+				bool ok = false;
+
+				for (int attempts = 1; ; attempts++)
+				{
+					ok = pgsql_set_gucs(useDst, dstSettings) &&
+						 copydb_create_index_by_oid(useSpecs, useDst, oid);
+
+					if (ok || attempts > PGSQL_EXECUTE_MAX_RETRIES ||
+						!pgsql_state_is_connection_error(useDst))
+					{
+						break;
+					}
+
+					log_warn("Connection to TARGET dropped while creating "
+							 "index oid %u (attempt %d/%d); reconnecting and "
+							 "replaying",
+							 oid, attempts, PGSQL_EXECUTE_MAX_RETRIES);
+
+					(void) pgsql_finish(useDst);
+				}
 
 				/*
 				 * Keep the connection open when another index is already

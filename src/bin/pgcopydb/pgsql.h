@@ -282,6 +282,15 @@ bool pgsql_retry_policy_expired(ConnectionRetryPolicy *retryPolicy);
 
 bool pgsql_state_is_connection_error(PGSQL *pgsql);
 
+/*
+ * How many times a clone worker reconnects and replays a unit of work (a
+ * single statement, an index build, a blob batch, a sequence setval batch)
+ * whose target connection was torn down mid-flight (class-08 / CONNECTION_BAD).
+ * The reopen itself already retries with jittered backoff, so this bounds the
+ * number of distinct drop-then-replay cycles.
+ */
+#define PGSQL_EXECUTE_MAX_RETRIES 5
+
 void pgsql_finish(PGSQL *pgsql);
 void parseSingleValueResult(void *ctx, PGresult *result);
 void fetchedRows(void *ctx, PGresult *result);

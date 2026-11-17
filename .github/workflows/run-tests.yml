@@ -118,6 +118,7 @@ jobs:
           - pagila-standby
           - unit
           - blobs
+          - target-connection-drop
           - filtering
           - extensions
           - timescaledb

@@ -111,6 +111,7 @@ jobs:
           - pagila-standby
           - unit
           - blobs
+          - target-connection-drop
           - filtering
           - partitioned-target
           - target-resume-recovery

@@ -316,34 +316,62 @@ copydb_copy_all_sequences(CopyDataSpec *specs, bool reset)
 		}
 	}
 
+	/*
+	 * Set every sequence inside one BEGIN/COMMIT, reconnecting and replaying
+	 * the whole transaction if the target tears the connection down mid-flight.
+	 * setval() is idempotent, so replaying every sequence (not just the ones
+	 * left after the drop) lands the same final values: the aborted
+	 * transaction committed nothing, and the restart recomputes context.count
+	 * from scratch.
+	 */
 	PGSQL dst = { 0 };
-
-	if (!pgsql_init(&dst, specs->connStrings.target_pguri, PGSQL_CONN_TARGET))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	if (!pgsql_begin(&dst))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
 	CopySeqContext context = { .dst = &dst, .count = 0 };
 
-	if (!catalog_iter_s_seq(sourceDB, &context, &copydb_copy_all_sequences_hook))
+	for (int attempts = 1; ; attempts++)
 	{
-		log_error("Failed to copy sequences values from our internal catalogs, "
-				  "see above for details");
-		(void) pgsql_finish(&dst);
-		return false;
-	}
+		context.count = 0;
 
-	if (!pgsql_commit(&dst))
-	{
-		/* errors have already been logged */
-		return false;
+		if (!pgsql_init(&dst, specs->connStrings.target_pguri, PGSQL_CONN_TARGET))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		bool ok =
+			pgsql_begin(&dst) &&
+			catalog_iter_s_seq(sourceDB, &context,
+							   &copydb_copy_all_sequences_hook) &&
+			pgsql_commit(&dst);
+
+		if (ok)
+		{
+			break;
+		}
+
+		/*
+		 * pgsql_begin and pgsql_commit finish (and NULL out) the connection on
+		 * failure, which hides it from pgsql_state_is_connection_error. BEGIN
+		 * and COMMIT only ever fail on a dropped connection though -- a genuine
+		 * setval error happens in the hook, which runs on a MULTI_STATEMENT
+		 * connection left open on error -- so a nulled connection here is a
+		 * connection error worth replaying.
+		 */
+		bool connError =
+			dst.connection == NULL || pgsql_state_is_connection_error(&dst);
+
+		if (attempts > PGSQL_EXECUTE_MAX_RETRIES || !connError)
+		{
+			log_error("Failed to copy sequences values to the target database, "
+					  "see above for details");
+			(void) pgsql_finish(&dst);
+			return false;
+		}
+
+		log_warn("Connection to TARGET dropped while setting sequence values "
+				 "(attempt %d/%d); reconnecting and replaying",
+				 attempts, PGSQL_EXECUTE_MAX_RETRIES);
+
+		(void) pgsql_finish(&dst);
 	}
 
 	if (reset)

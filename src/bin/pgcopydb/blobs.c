@@ -35,6 +35,15 @@ typedef struct BlobMetadataArrayContext
 
 void parseBlobMetadataArray(void *ctx, PGresult *result);
 
+static bool copydb_blob_worker_flush_batch_once(CopyDataSpec *specs,
+												DatabaseCatalog *sourceDB,
+												PGSQL *src,
+												PGSQL *dst,
+												QMessage *batch,
+												int count,
+												uint64_t *skippedBlobs,
+												uint64_t *metadataErrors);
+
 
 /*
  * copydb_start_blob_process starts a process that fetches the large object
@@ -341,6 +350,13 @@ copydb_start_blob_workers(CopyDataSpec *specs)
  * batched fast path is its own implicit transaction (one pipeline sync point
  * per large object), so that the target lock table usage stays bounded
  * whatever the total number of large objects.
+ *
+ * This wraps copydb_blob_worker_flush_batch_once with a reconnect-and-replay
+ * loop: the worker holds a long-lived MULTI_STATEMENT target connection that a
+ * loaded target can tear down mid-batch. Replaying the whole batch is safe
+ * because each large object is copied in its own transaction and the batch
+ * re-checks which objects already exist on the target (skip-or-copy), so the
+ * objects committed before the drop are skipped on the retry.
  */
 static bool
 copydb_blob_worker_flush_batch(CopyDataSpec *specs,
@@ -351,6 +367,69 @@ copydb_blob_worker_flush_batch(CopyDataSpec *specs,
 							   int count,
 							   uint64_t *skippedBlobs,
 							   uint64_t *metadataErrors)
+{
+	/*
+	 * The counters accumulate across batches, so snapshot them and reset to
+	 * the snapshot before each replay: a batch that dropped part-way through
+	 * incremented them for the large objects it had already handled, and the
+	 * replay recounts the whole batch from scratch.
+	 */
+	uint64_t skippedBlobsAtStart = *skippedBlobs;
+	uint64_t metadataErrorsAtStart = *metadataErrors;
+
+	for (int attempts = 1; ; attempts++)
+	{
+		*skippedBlobs = skippedBlobsAtStart;
+		*metadataErrors = metadataErrorsAtStart;
+
+		if (copydb_blob_worker_flush_batch_once(specs, sourceDB, src, dst,
+												batch, count,
+												skippedBlobs, metadataErrors))
+		{
+			return true;
+		}
+
+		if (attempts > PGSQL_EXECUTE_MAX_RETRIES ||
+			!pgsql_state_is_connection_error(dst))
+		{
+			return false;
+		}
+
+		log_warn("Connection to TARGET dropped while copying a batch of %d "
+				 "large objects (attempt %d/%d); reconnecting and replaying",
+				 count, attempts, PGSQL_EXECUTE_MAX_RETRIES);
+
+		/*
+		 * Finish the broken connection and re-open it in the same
+		 * MULTI_STATEMENT mode the worker set up, so the replayed batch runs
+		 * exactly as the first attempt did.
+		 */
+		(void) pgsql_finish(dst);
+
+		if (!pgsql_init(dst, specs->connStrings.target_pguri, PGSQL_CONN_TARGET))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		dst->connectionStatementType = PGSQL_CONNECTION_MULTI_STATEMENT;
+	}
+}
+
+
+/*
+ * copydb_blob_worker_flush_batch_once copies a batch of large objects to the
+ * target database in a single pass over an already-open target connection.
+ */
+static bool
+copydb_blob_worker_flush_batch_once(CopyDataSpec *specs,
+									DatabaseCatalog *sourceDB,
+									PGSQL *src,
+									PGSQL *dst,
+									QMessage *batch,
+									int count,
+									uint64_t *skippedBlobs,
+									uint64_t *metadataErrors)
 {
 	if (count == 0)
 	{
