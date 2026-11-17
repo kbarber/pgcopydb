@@ -41,6 +41,7 @@ static bool copydb_blob_worker_flush_batch_once(CopyDataSpec *specs,
 												PGSQL *dst,
 												QMessage *batch,
 												int count,
+												bool replaying,
 												uint64_t *skippedBlobs,
 												uint64_t *metadataErrors);
 
@@ -357,6 +358,13 @@ copydb_start_blob_workers(CopyDataSpec *specs)
  * because each large object is copied in its own transaction and the batch
  * re-checks which objects already exist on the target (skip-or-copy), so the
  * objects committed before the drop are skipped on the retry.
+ *
+ * A replay attempt (attempts > 1) tells the pass it is re-running a batch this
+ * worker partly committed, so that it reapplies the metadata of the large
+ * objects it now skips: their data was committed by the dropped attempt but
+ * their ACL and comment may not have been. A first attempt leaves ordinary
+ * resume semantics untouched (a large object already present from a previous
+ * run is skipped whole, metadata included).
  */
 static bool
 copydb_blob_worker_flush_batch(CopyDataSpec *specs,
@@ -384,6 +392,7 @@ copydb_blob_worker_flush_batch(CopyDataSpec *specs,
 
 		if (copydb_blob_worker_flush_batch_once(specs, sourceDB, src, dst,
 												batch, count,
+												attempts > 1,
 												skippedBlobs, metadataErrors))
 		{
 			return true;
@@ -428,6 +437,7 @@ copydb_blob_worker_flush_batch_once(CopyDataSpec *specs,
 									PGSQL *dst,
 									QMessage *batch,
 									int count,
+									bool replaying,
 									uint64_t *skippedBlobs,
 									uint64_t *metadataErrors)
 {
@@ -568,12 +578,13 @@ copydb_blob_worker_flush_batch_once(CopyDataSpec *specs,
 		 * actually has an ACL and/or a comment to copy, as advertised in the
 		 * queue message by the metadata producer process.
 		 *
-		 * Apply the metadata even when the data copy was skipped: a skip means
-		 * the object's data already exists on the target (a prior run, or an
-		 * attempt this worker committed before a connection drop it is now
-		 * replaying), but its ACL and comment may still be owed. The commands
-		 * are idempotent (REVOKE ALL then GRANT, COMMENT ... IS), so re-running
-		 * them for an object that already has them is harmless.
+		 * On a replay, also apply the metadata of a large object we skipped:
+		 * its data was committed by the attempt that then dropped, but its ACL
+		 * and comment may not have been. The commands are idempotent (REVOKE
+		 * ALL then GRANT, COMMENT ... IS), so reapplying them is harmless. On a
+		 * first attempt a skip keeps ordinary resume semantics: a large object
+		 * already present from a previous run is left entirely alone, so a
+		 * resume never overwrites metadata edited on the target.
 		 *
 		 * A failure to apply a large object's ACL or comment on the target
 		 * (e.g. a grantee role that does not exist there) only affects the
@@ -584,7 +595,7 @@ copydb_blob_worker_flush_batch_once(CopyDataSpec *specs,
 			(!noACL && batch[i].data.lo.hasACL) ||
 			(!noComments && batch[i].data.lo.hasComment);
 
-		if (copyMetadata)
+		if ((!skipped || replaying) && copyMetadata)
 		{
 			if (!pg_copy_large_object_metadata(src, dst,
 											   noACL,
