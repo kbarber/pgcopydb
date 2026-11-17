@@ -97,3 +97,26 @@ pgcopydb compare schema
 pgcopydb compare data
 
 echo "target-resume-constraint: clone --resume adopted the orphaned constraint summary and post-data skipped the primary keys"
+
+# Second scenario: clone --restart --drop-if-exists against a target that already
+# holds the tables and their primary keys (left by the runs above).
+#
+# --drop-if-exists issues DROP TABLE ... CASCADE on the target, which also drops
+# the primary keys, after the target catalog was already cached. The constraint
+# build must not trust that stale cache and skip recreating the now-dropped
+# primary keys, or the tables silently end up without them.
+pgcopydb clone --restart --drop-if-exists --not-consistent --notice \
+         --table-jobs "${PGCOPYDB_TABLE_JOBS}" \
+         --index-jobs "${PGCOPYDB_INDEX_JOBS}" \
+         --source "${PGCOPYDB_SOURCE_PGURI}" \
+         --target "${PGCOPYDB_TARGET_PGURI}"
+
+# Every table must still have its primary key on the target.
+pkeys=$(psql -AtX -d "${PGCOPYDB_TARGET_PGURI}" -c \
+  "select count(*) from pg_constraint where contype = 'p' and conrelid in ('public.t1'::regclass, 'public.t2'::regclass, 'public.t3'::regclass)")
+test "${pkeys}" = "3"
+
+pgcopydb compare schema
+pgcopydb compare data
+
+echo "target-resume-constraint: clone --restart --drop-if-exists rebuilt the dropped primary keys instead of trusting the stale target cache"
