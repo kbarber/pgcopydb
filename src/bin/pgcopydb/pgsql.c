@@ -451,6 +451,19 @@ pgsql_finish(PGSQL *pgsql)
 					pgsql->safeURI.pguri);
 		}
 
+		/*
+		 * Remember a dropped/broken connection before we lose the handle: the
+		 * fetch/clear path finishes the connection on a reset, so the later
+		 * classify in the multi-statement replay loops would otherwise see a
+		 * NULL connection and no longer be able to tell a reset apart from a
+		 * clean close. pgsql_state_is_connection_error() reads this back.
+		 */
+		if (PQstatus(pgsql->connection) == CONNECTION_BAD ||
+			pgsql->status == PG_CONNECTION_BAD)
+		{
+			pgsql->connDropped = true;
+		}
+
 		PQfinish(pgsql->connection);
 		pgsql->connection = NULL;
 
@@ -627,6 +640,7 @@ pgsql_open_connection(PGSQL *pgsql)
 	INSTR_TIME_SET_CURRENT(pgsql->retryPolicy.connectTime);
 	pgsql->status = PG_CONNECTION_OK;
 	pgsql->sqlstate[0] = '\0';
+	pgsql->connDropped = false;
 
 	/* set the libpq notice receiver to integrate notifications as warnings. */
 	PQsetNoticeProcessor(pgsql->connection,
@@ -2707,9 +2721,19 @@ is_response_ok(PGresult *result)
 bool
 pgsql_state_is_connection_error(PGSQL *pgsql)
 {
-	return pgsql->connection != NULL &&
-		   (PQstatus(pgsql->connection) == CONNECTION_BAD ||
-			SQLSTATE_IS_CONNECTION_EXCEPTION(pgsql));
+	/*
+	 * When the connection is still open, classify it live. Once it has been
+	 * finished (the fetch/clear path closes it on a reset), fall back to the
+	 * sticky flag pgsql_finish() recorded: the multi-statement replay loops
+	 * classify after that close and would otherwise see only a NULL handle.
+	 */
+	if (pgsql->connection == NULL)
+	{
+		return pgsql->connDropped;
+	}
+
+	return PQstatus(pgsql->connection) == CONNECTION_BAD ||
+		   SQLSTATE_IS_CONNECTION_EXCEPTION(pgsql);
 }
 
 

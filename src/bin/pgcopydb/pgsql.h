@@ -209,6 +209,14 @@ typedef struct PGSQL
 	int64_t notificationNodeId;
 	bool notificationReceived;
 
+	/*
+	 * Sticky record of a dropped/broken connection that survives pgsql_finish()
+	 * so the multi-statement reconnect-and-replay loops (CREATE INDEX, blobs,
+	 * sequences) can still classify a reset after the fetch/clear path has
+	 * closed and NULL'd the connection. Cleared when a fresh connection opens.
+	 */
+	bool connDropped;
+
 	bool logSQL;
 	bool singleRowMode;
 

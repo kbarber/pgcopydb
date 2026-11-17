@@ -350,16 +350,12 @@ copydb_copy_all_sequences(CopyDataSpec *specs, bool reset)
 
 		/*
 		 * pgsql_begin and pgsql_commit finish (and NULL out) the connection on
-		 * failure, which hides it from pgsql_state_is_connection_error. BEGIN
-		 * and COMMIT only ever fail on a dropped connection though -- a genuine
-		 * setval error happens in the hook, which runs on a MULTI_STATEMENT
-		 * connection left open on error -- so a nulled connection here is a
-		 * connection error worth replaying.
+		 * failure; pgsql_state_is_connection_error() reads the sticky drop flag
+		 * pgsql_finish() records, so a reset is still classified as such after
+		 * the connection is gone.
 		 */
-		bool connError =
-			dst.connection == NULL || pgsql_state_is_connection_error(&dst);
-
-		if (attempts > PGSQL_EXECUTE_MAX_RETRIES || !connError)
+		if (attempts > PGSQL_EXECUTE_MAX_RETRIES ||
+			!pgsql_state_is_connection_error(&dst))
 		{
 			log_error("Failed to copy sequences values to the target database, "
 					  "see above for details");
