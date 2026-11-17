@@ -3691,6 +3691,12 @@ pgsql_set_gucs(PGSQL *pgsql, GUC *settings)
  * identifier, the large object ownership is also restored on the target:
  * pgcopydb creates the large object itself via lo_create(), so the object is
  * initially owned by the connecting role.
+ *
+ * On error this leaves both connections open for the caller to inspect and
+ * recover: the worker owns their whole life (the source holds an exported
+ * snapshot that cannot be rebuilt here, and the target is replayed a batch at
+ * a time), so finishing them here would both destroy the snapshot and hide a
+ * dropped target connection from the caller's reconnect-and-replay decision.
  */
 bool
 pg_copy_large_object(PGSQL *src,
@@ -3736,8 +3742,6 @@ pg_copy_large_object(PGSQL *src,
 		{
 			log_error("Failed to delete large object %u", blobOid);
 
-			pgsql_finish(src);
-			pgsql_finish(dst);
 			return false;
 		}
 	}
@@ -3758,8 +3762,6 @@ pg_copy_large_object(PGSQL *src,
 			log_error("Failed to check existence of large object %u on target",
 					  blobOid);
 
-			pgsql_finish(src);
-			pgsql_finish(dst);
 			return false;
 		}
 
@@ -3816,8 +3818,6 @@ pg_copy_large_object(PGSQL *src,
 			{
 				log_error("Failed to delete empty large object %u", blobOid);
 
-				pgsql_finish(src);
-				pgsql_finish(dst);
 				return false;
 			}
 		}
@@ -3837,9 +3837,6 @@ pg_copy_large_object(PGSQL *src,
 
 		(void) pgcopy_log_error(dst, NULL, context);
 
-		pgsql_finish(src);
-		pgsql_finish(dst);
-
 		return false;
 	}
 
@@ -3856,9 +3853,6 @@ pg_copy_large_object(PGSQL *src,
 				"Failed to open large object %u", blobOid);
 
 		(void) pgcopy_log_error(src, NULL, context);
-
-		pgsql_finish(src);
-		pgsql_finish(dst);
 
 		return false;
 	}
@@ -3878,9 +3872,6 @@ pg_copy_large_object(PGSQL *src,
 		(void) pgcopy_log_error(dst, NULL, context);
 
 		lo_close(src->connection, srcfd);
-
-		pgsql_finish(src);
-		pgsql_finish(dst);
 
 		return false;
 	}
@@ -3907,9 +3898,6 @@ pg_copy_large_object(PGSQL *src,
 		lo_close(src->connection, srcfd);
 		lo_close(dst->connection, dstfd);
 
-		pgsql_finish(src);
-		pgsql_finish(dst);
-
 		return false;
 	}
 
@@ -3929,9 +3917,6 @@ pg_copy_large_object(PGSQL *src,
 			lo_close(src->connection, srcfd);
 			lo_close(dst->connection, dstfd);
 
-			pgsql_finish(src);
-			pgsql_finish(dst);
-
 			return false;
 		}
 
@@ -3949,9 +3934,6 @@ pg_copy_large_object(PGSQL *src,
 
 			lo_close(src->connection, srcfd);
 			lo_close(dst->connection, dstfd);
-
-			pgsql_finish(src);
-			pgsql_finish(dst);
 
 			return false;
 		}
@@ -3985,9 +3967,6 @@ pg_copy_large_object(PGSQL *src,
 			log_error("Failed to set owner of large object %u to %s",
 					  blobOid,
 					  rolname);
-
-			pgsql_finish(src);
-			pgsql_finish(dst);
 
 			return false;
 		}

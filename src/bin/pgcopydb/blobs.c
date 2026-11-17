@@ -568,6 +568,13 @@ copydb_blob_worker_flush_batch_once(CopyDataSpec *specs,
 		 * actually has an ACL and/or a comment to copy, as advertised in the
 		 * queue message by the metadata producer process.
 		 *
+		 * Apply the metadata even when the data copy was skipped: a skip means
+		 * the object's data already exists on the target (a prior run, or an
+		 * attempt this worker committed before a connection drop it is now
+		 * replaying), but its ACL and comment may still be owed. The commands
+		 * are idempotent (REVOKE ALL then GRANT, COMMENT ... IS), so re-running
+		 * them for an object that already has them is harmless.
+		 *
 		 * A failure to apply a large object's ACL or comment on the target
 		 * (e.g. a grantee role that does not exist there) only affects the
 		 * commands of the large object at hand, which run in their own
@@ -577,7 +584,7 @@ copydb_blob_worker_flush_batch_once(CopyDataSpec *specs,
 			(!noACL && batch[i].data.lo.hasACL) ||
 			(!noComments && batch[i].data.lo.hasComment);
 
-		if (!skipped && copyMetadata)
+		if (copyMetadata)
 		{
 			if (!pg_copy_large_object_metadata(src, dst,
 											   noACL,

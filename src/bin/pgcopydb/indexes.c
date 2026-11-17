@@ -1093,8 +1093,28 @@ copydb_index_is_being_processed(CopyDataSpec *specs,
 
 	if (indexSummary->pid != 0)
 	{
+		/*
+		 * A reservation left by our own pid is a leftover from a prior attempt
+		 * in this process that failed (a mid-build connection drop that we are
+		 * now replaying): one process builds one index at a time, so it cannot
+		 * legitimately be in flight elsewhere. Remove it and reprocess, just
+		 * like a stale pid from a dead process below.
+		 */
+		if (indexSummary->pid == getpid())
+		{
+			log_notice("Reprocessing index %s after a failed attempt by this "
+					   "worker (pid %d)",
+					   indexSpecs->sourceIndex->indexQname,
+					   indexSummary->pid);
+
+			if (!summary_delete_index(sourceDB, indexSpecs))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+		}
 		/* if we can signal the pid, it is still running */
-		if (kill(indexSummary->pid, 0) == 0)
+		else if (kill(indexSummary->pid, 0) == 0)
 		{
 			log_error("Failed to start CREATE INDEX worker for index %s (%u), "
 					  "already being processed by pid %d",
