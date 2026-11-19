@@ -219,6 +219,7 @@ cli_copydb_getenv(CopyDBOptions *options)
 	options->restoreOptions.jobs = DEFAULT_RESTORE_JOBS;
 	options->lObjectJobs = DEFAULT_LARGE_OBJECTS_JOBS;
 	options->splitTablesLargerThan.bytes = DEFAULT_SPLIT_TABLES_LARGER_THAN;
+	options->maxReplayAttempts = DEFAULT_MAX_REPLAY_ATTEMPTS;
 
 	EnvParser parsers[] = {
 		{
@@ -288,6 +289,10 @@ cli_copydb_getenv(CopyDBOptions *options)
 		{
 			PGCOPYDB_REPLAY_NO_OP_UPDATES, ENV_TYPE_BOOL,
 			&(options->replayNoOpUpdates)
+		},
+		{
+			PGCOPYDB_MAX_REPLAY_ATTEMPTS, ENV_TYPE_INT,
+			&(options->maxReplayAttempts), 0, true, 0
 		}
 	};
 
@@ -757,6 +762,7 @@ cli_copy_db_getopts(int argc, char **argv)
 		{ "enable-failover", no_argument, NULL, 1006 },
 		{ "max-restarts", required_argument, NULL, 1007 },
 		{ "restart-window", required_argument, NULL, 1008 },
+		{ "max-replay-attempts", required_argument, NULL, 1009 },
 		{ "host", required_argument, NULL, 1001 },
 		{ "port", required_argument, NULL, 1002 },
 		{ "version", no_argument, NULL, 'V' },
@@ -1189,6 +1195,20 @@ cli_copy_db_getopts(int argc, char **argv)
 				break;
 			}
 
+			case 1009:      /* --max-replay-attempts */
+			{
+				if (!stringToInt(optarg, &options.maxReplayAttempts) ||
+					options.maxReplayAttempts < 0)
+				{
+					log_fatal("Failed to parse --max-replay-attempts, "
+							  "expected a number, 0 to disable: \"%s\"",
+							  optarg);
+					++errors;
+				}
+				log_trace("--max-replay-attempts %d", options.maxReplayAttempts);
+				break;
+			}
+
 			case 1001:      /* --host: follow coordinator TCP listen host */
 			{
 				strlcpy(options.host, optarg, sizeof(options.host));
@@ -1354,6 +1374,9 @@ cli_copy_db_getopts(int argc, char **argv)
 
 	/* publish our option parsing in the global variable */
 	copyDBoptions = options;
+
+	/* seed the process-wide reconnect-and-replay ceiling, read by workers */
+	(void) pgsql_set_max_replay_attempts(options.maxReplayAttempts);
 
 	return optind;
 }

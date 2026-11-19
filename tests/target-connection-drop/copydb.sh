@@ -44,11 +44,13 @@ killer_pid=$!
 
 # Run the clone while the killer resets target connections underneath it.
 # --restart so a re-run inside the same container starts clean; the clone is
-# expected to exit 0 despite the resets. Capture the exit code rather than
-# letting `set -e` abort, so the killer is always stopped and the failure is
-# reported explicitly below.
+# expected to exit 0 despite the resets. --max-replay-attempts enables the
+# reconnect-and-replay paths (off by default); without it the first reset would
+# fail the clone. Capture the exit code rather than letting `set -e` abort, so
+# the killer is always stopped and the failure is reported explicitly below.
 clone_rc=0
 pgcopydb clone --notice --restart \
+         --max-replay-attempts 5 \
          --table-jobs "${PGCOPYDB_TABLE_JOBS}" \
          --index-jobs "${PGCOPYDB_INDEX_JOBS}" \
          --source "${PGCOPYDB_SOURCE_PGURI}" \

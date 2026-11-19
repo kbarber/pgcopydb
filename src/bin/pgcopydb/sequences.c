@@ -327,6 +327,8 @@ copydb_copy_all_sequences(CopyDataSpec *specs, bool reset)
 	PGSQL dst = { 0 };
 	CopySeqContext context = { .dst = &dst, .count = 0 };
 
+	int maxReplayAttempts = pgsql_get_max_replay_attempts();
+
 	for (int attempts = 1; ; attempts++)
 	{
 		context.count = 0;
@@ -354,7 +356,7 @@ copydb_copy_all_sequences(CopyDataSpec *specs, bool reset)
 		 * pgsql_finish() records, so a reset is still classified as such after
 		 * the connection is gone.
 		 */
-		if (attempts > PGSQL_EXECUTE_MAX_RETRIES ||
+		if (attempts > maxReplayAttempts ||
 			!pgsql_state_is_connection_error(&dst))
 		{
 			log_error("Failed to copy sequences values to the target database, "
@@ -365,7 +367,7 @@ copydb_copy_all_sequences(CopyDataSpec *specs, bool reset)
 
 		log_warn("Connection to TARGET dropped while setting sequence values "
 				 "(attempt %d/%d); reconnecting and replaying",
-				 attempts, PGSQL_EXECUTE_MAX_RETRIES);
+				 attempts, maxReplayAttempts);
 
 		(void) pgsql_finish(&dst);
 	}

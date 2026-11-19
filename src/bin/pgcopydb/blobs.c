@@ -385,6 +385,8 @@ copydb_blob_worker_flush_batch(CopyDataSpec *specs,
 	uint64_t skippedBlobsAtStart = *skippedBlobs;
 	uint64_t metadataErrorsAtStart = *metadataErrors;
 
+	int maxReplayAttempts = pgsql_get_max_replay_attempts();
+
 	for (int attempts = 1; ; attempts++)
 	{
 		*skippedBlobs = skippedBlobsAtStart;
@@ -398,7 +400,7 @@ copydb_blob_worker_flush_batch(CopyDataSpec *specs,
 			return true;
 		}
 
-		if (attempts > PGSQL_EXECUTE_MAX_RETRIES ||
+		if (attempts > maxReplayAttempts ||
 			!pgsql_state_is_connection_error(dst))
 		{
 			return false;
@@ -406,7 +408,7 @@ copydb_blob_worker_flush_batch(CopyDataSpec *specs,
 
 		log_warn("Connection to TARGET dropped while copying a batch of %d "
 				 "large objects (attempt %d/%d); reconnecting and replaying",
-				 count, attempts, PGSQL_EXECUTE_MAX_RETRIES);
+				 count, attempts, maxReplayAttempts);
 
 		/*
 		 * Finish the broken connection and re-open it in the same

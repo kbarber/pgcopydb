@@ -178,6 +178,35 @@ fetchedRows(void *ctx, PGresult *result)
 
 
 /*
+ * Max reconnect-and-replay cycles per unit of work whose connection dropped
+ * mid-flight. Set once before any worker forks, read-only afterwards.
+ */
+static int pgsqlMaxReplayAttempts = DEFAULT_MAX_REPLAY_ATTEMPTS;
+
+
+/*
+ * pgsql_set_max_replay_attempts seeds the process-wide reconnect-and-replay
+ * ceiling. Call once at startup, before forking the clone workers.
+ */
+void
+pgsql_set_max_replay_attempts(int attempts)
+{
+	pgsqlMaxReplayAttempts = attempts;
+}
+
+
+/*
+ * pgsql_get_max_replay_attempts returns the process-wide reconnect-and-replay
+ * ceiling read by the worker retry loops.
+ */
+int
+pgsql_get_max_replay_attempts(void)
+{
+	return pgsqlMaxReplayAttempts;
+}
+
+
+/*
  * pgsql_init initializes a PGSQL struct to connect to the given database
  * URL or connection string.
  */
@@ -1563,6 +1592,8 @@ pgsql_execute_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 	bool singleStatement =
 		pgsql->connectionStatementType == PGSQL_CONNECTION_SINGLE_STATEMENT;
 
+	int maxReplayAttempts = pgsql_get_max_replay_attempts();
+
 	for (int attempts = 1; ; attempts++)
 	{
 		bool isConnError = false;
@@ -1576,13 +1607,13 @@ pgsql_execute_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 
 		/*
 		 * Only replay a single-statement call whose connection dropped, and
-		 * only up to PGSQL_EXECUTE_MAX_RETRIES times. A genuine SQL error (a
-		 * permission denial, a constraint violation) is not a connection error
-		 * and must fail immediately.
+		 * only up to maxReplayAttempts times. A genuine SQL error (a permission
+		 * denial, a constraint violation) is not a connection error and must
+		 * fail immediately.
 		 */
 		if (!singleStatement ||
 			!isConnError ||
-			attempts > PGSQL_EXECUTE_MAX_RETRIES)
+			attempts > maxReplayAttempts)
 		{
 			return false;
 		}
@@ -1591,7 +1622,7 @@ pgsql_execute_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 				 "(attempt %d/%d); reconnecting and replaying",
 				 pgsql->connectionType == PGSQL_CONN_SOURCE ? "SOURCE" : "TARGET",
 				 attempts,
-				 PGSQL_EXECUTE_MAX_RETRIES);
+				 maxReplayAttempts);
 	}
 }
 

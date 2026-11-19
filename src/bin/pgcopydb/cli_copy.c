@@ -49,6 +49,7 @@ static CommandLine copy_db_command =
 		"  --skip-large-objects  Skip copying large objects (blobs)\n"
 		"  --filters <filename>  Use the filters defined in <filename>\n"
 		"  --fail-fast           Abort early in case of error\n"
+		"  --max-replay-attempts <n>  Reconnect and replay a dropped unit of work at most n times (default 0, disabled)\n"
 		"  --restart             Allow restarting when temp files exist already\n"
 		"  --resume              Allow resuming operations after a failure\n"
 		"  --not-consistent      Allow taking a new snapshot on the source database\n"

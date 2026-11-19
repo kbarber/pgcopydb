@@ -400,13 +400,14 @@ copydb_index_worker(CopyDataSpec *specs)
 				 * connection and the next pgsql_set_gucs re-opens a fresh one.
 				 */
 				bool ok = false;
+				int maxReplayAttempts = pgsql_get_max_replay_attempts();
 
 				for (int attempts = 1; ; attempts++)
 				{
 					ok = pgsql_set_gucs(useDst, dstSettings) &&
 						 copydb_create_index_by_oid(useSpecs, useDst, oid);
 
-					if (ok || attempts > PGSQL_EXECUTE_MAX_RETRIES ||
+					if (ok || attempts > maxReplayAttempts ||
 						!pgsql_state_is_connection_error(useDst))
 					{
 						break;
@@ -415,7 +416,7 @@ copydb_index_worker(CopyDataSpec *specs)
 					log_warn("Connection to TARGET dropped while creating "
 							 "index oid %u (attempt %d/%d); reconnecting and "
 							 "replaying",
-							 oid, attempts, PGSQL_EXECUTE_MAX_RETRIES);
+							 oid, attempts, maxReplayAttempts);
 
 					(void) pgsql_finish(useDst);
 				}
