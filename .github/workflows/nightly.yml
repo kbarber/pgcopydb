@@ -112,6 +112,7 @@ jobs:
           - unit
           - blobs
           - target-connection-drop
+          - target-resume-constraint
           - filtering
           - partitioned-target
           - target-resume-recovery
