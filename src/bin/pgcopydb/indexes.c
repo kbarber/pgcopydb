@@ -394,18 +394,25 @@ copydb_index_worker(CopyDataSpec *specs)
 				 * tears the connection down mid-build. pgsql_set_gucs promotes
 				 * useDst to a MULTI_STATEMENT connection, so the CREATE INDEX
 				 * runs outside the single-statement reconnect in
-				 * pgsql_execute_with_params and has to be retried here. A drop
-				 * mid-CREATE-INDEX leaves nothing committed on the server, so
-				 * replaying the whole unit is safe: we finish the broken
-				 * connection and the next pgsql_set_gucs re-opens a fresh one.
+				 * pgsql_execute_with_params and has to be retried here. We
+				 * finish the broken connection and the next pgsql_set_gucs
+				 * re-opens a fresh one.
+				 *
+				 * A reset can land after the CREATE INDEX actually committed on
+				 * the server but before its acknowledgement reached us, so a
+				 * replay forces IF NOT EXISTS to adopt that already-built index
+				 * rather than fail on "relation already exists".
 				 */
 				bool ok = false;
 				int maxReplayAttempts = pgsql_get_max_replay_attempts();
 
 				for (int attempts = 1; ; attempts++)
 				{
+					bool replaying = attempts > 1;
+
 					ok = pgsql_set_gucs(useDst, dstSettings) &&
-						 copydb_create_index_by_oid(useSpecs, useDst, oid);
+						 copydb_create_index_by_oid(useSpecs, useDst, oid,
+													replaying);
 
 					if (ok || attempts > maxReplayAttempts ||
 						!pgsql_state_is_connection_error(useDst))
@@ -522,7 +529,8 @@ copydb_index_worker(CopyDataSpec *specs)
  * creates the index on the target database.
  */
 bool
-copydb_create_index_by_oid(CopyDataSpec *specs, PGSQL *dst, uint32_t indexOid)
+copydb_create_index_by_oid(CopyDataSpec *specs, PGSQL *dst, uint32_t indexOid,
+						   bool forceIfNotExists)
 {
 	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
 
@@ -572,9 +580,17 @@ copydb_create_index_by_oid(CopyDataSpec *specs, PGSQL *dst, uint32_t indexOid)
 	 * Add IF NOT EXISTS clause when the --resume option has been used, or when
 	 * the command is `pgcopydb copy indexes`, in which cases we don't know
 	 * what to expect on the target database.
+	 *
+	 * forceIfNotExists covers a reconnect-and-replay attempt: a reset can land
+	 * after CREATE INDEX commits on the server but before its acknowledgement
+	 * reaches us, so the index may already exist on the target even though this
+	 * attempt sees the connection as dropped. Replaying with IF NOT EXISTS
+	 * adopts that committed index instead of failing on "relation already
+	 * exists".
 	 */
 	bool ifNotExists =
-		specs->resume || specs->section == DATA_SECTION_INDEXES;
+		specs->resume || specs->section == DATA_SECTION_INDEXES ||
+		forceIfNotExists;
 
 	if (!copydb_create_index(specs, dst, index, ifNotExists))
 	{

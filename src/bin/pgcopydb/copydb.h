@@ -444,7 +444,8 @@ bool copydb_start_index_supervisor(CopyDataSpec *specs, pid_t *pidOut);
 bool copydb_index_supervisor(CopyDataSpec *specs);
 bool copydb_start_index_workers(CopyDataSpec *specs);
 bool copydb_index_worker(CopyDataSpec *specs);
-bool copydb_create_index_by_oid(CopyDataSpec *specs, PGSQL *dst, uint32_t indexOid);
+bool copydb_create_index_by_oid(CopyDataSpec *specs, PGSQL *dst, uint32_t indexOid,
+								bool forceIfNotExists);
 
 bool copydb_add_table_indexes(CopyDataSpec *specs,
 							  CopyTableDataSpec *tableSpecs);
