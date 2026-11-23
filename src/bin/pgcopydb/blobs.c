@@ -35,6 +35,16 @@ typedef struct BlobMetadataArrayContext
 
 void parseBlobMetadataArray(void *ctx, PGresult *result);
 
+static bool copydb_blob_worker_flush_batch_once(CopyDataSpec *specs,
+												DatabaseCatalog *sourceDB,
+												PGSQL *src,
+												PGSQL *dst,
+												QMessage *batch,
+												int count,
+												bool replaying,
+												uint64_t *skippedBlobs,
+												uint64_t *metadataErrors);
+
 
 /*
  * copydb_start_blob_process starts a process that fetches the large object
@@ -341,6 +351,20 @@ copydb_start_blob_workers(CopyDataSpec *specs)
  * batched fast path is its own implicit transaction (one pipeline sync point
  * per large object), so that the target lock table usage stays bounded
  * whatever the total number of large objects.
+ *
+ * This wraps copydb_blob_worker_flush_batch_once with a reconnect-and-replay
+ * loop: the worker holds a long-lived MULTI_STATEMENT target connection that
+ * the target can tear down mid-batch. Replaying the whole batch is safe
+ * because each large object is copied in its own transaction and the batch
+ * re-checks which objects already exist on the target (skip-or-copy), so the
+ * objects committed before the drop are skipped on the retry.
+ *
+ * A replay attempt (attempts > 1) tells the pass it is re-running a batch this
+ * worker partly committed, so that it reapplies the metadata of the large
+ * objects it now skips: their data was committed by the dropped attempt but
+ * their ACL and comment may not have been. A first attempt leaves ordinary
+ * resume semantics untouched (a large object already present from a previous
+ * run is skipped whole, metadata included).
  */
 static bool
 copydb_blob_worker_flush_batch(CopyDataSpec *specs,
@@ -351,6 +375,73 @@ copydb_blob_worker_flush_batch(CopyDataSpec *specs,
 							   int count,
 							   uint64_t *skippedBlobs,
 							   uint64_t *metadataErrors)
+{
+	/*
+	 * The counters accumulate across batches, so snapshot them and reset to
+	 * the snapshot before each replay: a batch that dropped part-way through
+	 * incremented them for the large objects it had already handled, and the
+	 * replay recounts the whole batch from scratch.
+	 */
+	uint64_t skippedBlobsAtStart = *skippedBlobs;
+	uint64_t metadataErrorsAtStart = *metadataErrors;
+
+	int maxReplayAttempts = pgsql_get_max_replay_attempts();
+
+	for (int attempts = 1; ; attempts++)
+	{
+		*skippedBlobs = skippedBlobsAtStart;
+		*metadataErrors = metadataErrorsAtStart;
+
+		if (copydb_blob_worker_flush_batch_once(specs, sourceDB, src, dst,
+												batch, count,
+												attempts > 1,
+												skippedBlobs, metadataErrors))
+		{
+			return true;
+		}
+
+		if (attempts > maxReplayAttempts ||
+			!pgsql_state_is_connection_error(dst))
+		{
+			return false;
+		}
+
+		log_warn("Connection to TARGET dropped while copying a batch of %d "
+				 "large objects (attempt %d/%d); reconnecting and replaying",
+				 count, attempts, maxReplayAttempts);
+
+		/*
+		 * Finish the broken connection and re-open it in the same
+		 * MULTI_STATEMENT mode the worker set up, so the replayed batch runs
+		 * exactly as the first attempt did.
+		 */
+		(void) pgsql_finish(dst);
+
+		if (!pgsql_init(dst, specs->connStrings.target_pguri, PGSQL_CONN_TARGET))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		dst->connectionStatementType = PGSQL_CONNECTION_MULTI_STATEMENT;
+	}
+}
+
+
+/*
+ * copydb_blob_worker_flush_batch_once copies a batch of large objects to the
+ * target database in a single pass over an already-open target connection.
+ */
+static bool
+copydb_blob_worker_flush_batch_once(CopyDataSpec *specs,
+									DatabaseCatalog *sourceDB,
+									PGSQL *src,
+									PGSQL *dst,
+									QMessage *batch,
+									int count,
+									bool replaying,
+									uint64_t *skippedBlobs,
+									uint64_t *metadataErrors)
 {
 	if (count == 0)
 	{
@@ -489,6 +580,14 @@ copydb_blob_worker_flush_batch(CopyDataSpec *specs,
 		 * actually has an ACL and/or a comment to copy, as advertised in the
 		 * queue message by the metadata producer process.
 		 *
+		 * On a replay, also apply the metadata of a large object we skipped:
+		 * its data was committed by the attempt that then dropped, but its ACL
+		 * and comment may not have been. The commands are idempotent (REVOKE
+		 * ALL then GRANT, COMMENT ... IS), so reapplying them is harmless. On a
+		 * first attempt a skip keeps ordinary resume semantics: a large object
+		 * already present from a previous run is left entirely alone, so a
+		 * resume never overwrites metadata edited on the target.
+		 *
 		 * A failure to apply a large object's ACL or comment on the target
 		 * (e.g. a grantee role that does not exist there) only affects the
 		 * commands of the large object at hand, which run in their own
@@ -498,7 +597,7 @@ copydb_blob_worker_flush_batch(CopyDataSpec *specs,
 			(!noACL && batch[i].data.lo.hasACL) ||
 			(!noComments && batch[i].data.lo.hasComment);
 
-		if (!skipped && copyMetadata)
+		if ((!skipped || replaying) && copyMetadata)
 		{
 			if (!pg_copy_large_object_metadata(src, dst,
 											   noACL,

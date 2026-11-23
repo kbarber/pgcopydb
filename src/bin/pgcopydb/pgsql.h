@@ -209,6 +209,14 @@ typedef struct PGSQL
 	int64_t notificationNodeId;
 	bool notificationReceived;
 
+	/*
+	 * Sticky record of a dropped/broken connection that survives pgsql_finish()
+	 * so the multi-statement reconnect-and-replay loops (CREATE INDEX, blobs,
+	 * sequences) can still classify a reset after the fetch/clear path has
+	 * closed and NULL'd the connection. Cleared when a fresh connection opens.
+	 */
+	bool connDropped;
+
 	bool logSQL;
 	bool singleRowMode;
 
@@ -281,6 +289,20 @@ void pgsql_retry_policy_renew(ConnectionRetryPolicy *retryPolicy);
 bool pgsql_retry_policy_expired(ConnectionRetryPolicy *retryPolicy);
 
 bool pgsql_state_is_connection_error(PGSQL *pgsql);
+
+/*
+ * How many times a clone worker reconnects and replays a unit of work (a
+ * single statement, an index build, a blob batch, a sequence setval batch)
+ * whose connection was torn down mid-flight (class-08 / CONNECTION_BAD). The
+ * reopen itself already retries with jittered backoff, so this bounds the
+ * number of distinct drop-then-replay cycles. Zero (the default) disables
+ * replay: the first drop fails the work, which is the historical behavior.
+ *
+ * Seeded once at startup from --max-replay-attempts / PGCOPYDB_MAX_REPLAY_ATTEMPTS
+ * and read-only afterwards, so it is safe to share across forked workers.
+ */
+void pgsql_set_max_replay_attempts(int attempts);
+int pgsql_get_max_replay_attempts(void);
 
 void pgsql_finish(PGSQL *pgsql);
 void parseSingleValueResult(void *ctx, PGresult *result);

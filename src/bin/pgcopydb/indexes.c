@@ -389,8 +389,44 @@ copydb_index_worker(CopyDataSpec *specs)
 				 * after the fact -- just never leave it idle in the first
 				 * place.
 				 */
-				bool ok = pgsql_set_gucs(useDst, dstSettings) &&
-						  copydb_create_index_by_oid(useSpecs, useDst, oid);
+				/*
+				 * Build this index, reconnecting and replaying if the target
+				 * tears the connection down mid-build. pgsql_set_gucs promotes
+				 * useDst to a MULTI_STATEMENT connection, so the CREATE INDEX
+				 * runs outside the single-statement reconnect in
+				 * pgsql_execute_with_params and has to be retried here. We
+				 * finish the broken connection and the next pgsql_set_gucs
+				 * re-opens a fresh one.
+				 *
+				 * A reset can land after the CREATE INDEX actually committed on
+				 * the server but before its acknowledgement reached us, so a
+				 * replay forces IF NOT EXISTS to adopt that already-built index
+				 * rather than fail on "relation already exists".
+				 */
+				bool ok = false;
+				int maxReplayAttempts = pgsql_get_max_replay_attempts();
+
+				for (int attempts = 1; ; attempts++)
+				{
+					bool replaying = attempts > 1;
+
+					ok = pgsql_set_gucs(useDst, dstSettings) &&
+						 copydb_create_index_by_oid(useSpecs, useDst, oid,
+													replaying);
+
+					if (ok || attempts > maxReplayAttempts ||
+						!pgsql_state_is_connection_error(useDst))
+					{
+						break;
+					}
+
+					log_warn("Connection to TARGET dropped while creating "
+							 "index oid %u (attempt %d/%d); reconnecting and "
+							 "replaying",
+							 oid, attempts, maxReplayAttempts);
+
+					(void) pgsql_finish(useDst);
+				}
 
 				/*
 				 * Keep the connection open when another index is already
@@ -493,7 +529,8 @@ copydb_index_worker(CopyDataSpec *specs)
  * creates the index on the target database.
  */
 bool
-copydb_create_index_by_oid(CopyDataSpec *specs, PGSQL *dst, uint32_t indexOid)
+copydb_create_index_by_oid(CopyDataSpec *specs, PGSQL *dst, uint32_t indexOid,
+						   bool forceIfNotExists)
 {
 	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
 
@@ -543,9 +580,17 @@ copydb_create_index_by_oid(CopyDataSpec *specs, PGSQL *dst, uint32_t indexOid)
 	 * Add IF NOT EXISTS clause when the --resume option has been used, or when
 	 * the command is `pgcopydb copy indexes`, in which cases we don't know
 	 * what to expect on the target database.
+	 *
+	 * forceIfNotExists covers a reconnect-and-replay attempt: a reset can land
+	 * after CREATE INDEX commits on the server but before its acknowledgement
+	 * reaches us, so the index may already exist on the target even though this
+	 * attempt sees the connection as dropped. Replaying with IF NOT EXISTS
+	 * adopts that committed index instead of failing on "relation already
+	 * exists".
 	 */
 	bool ifNotExists =
-		specs->resume || specs->section == DATA_SECTION_INDEXES;
+		specs->resume || specs->section == DATA_SECTION_INDEXES ||
+		forceIfNotExists;
 
 	if (!copydb_create_index(specs, dst, index, ifNotExists))
 	{
@@ -1065,8 +1110,28 @@ copydb_index_is_being_processed(CopyDataSpec *specs,
 
 	if (indexSummary->pid != 0)
 	{
+		/*
+		 * A reservation left by our own pid is a leftover from a prior attempt
+		 * in this process that failed (a mid-build connection drop that we are
+		 * now replaying): one process builds one index at a time, so it cannot
+		 * legitimately be in flight elsewhere. Remove it and reprocess, just
+		 * like a stale pid from a dead process below.
+		 */
+		if (indexSummary->pid == getpid())
+		{
+			log_notice("Reprocessing index %s after a failed attempt by this "
+					   "worker (pid %d)",
+					   indexSpecs->sourceIndex->indexQname,
+					   indexSummary->pid);
+
+			if (!summary_delete_index(sourceDB, indexSpecs))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+		}
 		/* if we can signal the pid, it is still running */
-		if (kill(indexSummary->pid, 0) == 0)
+		else if (kill(indexSummary->pid, 0) == 0)
 		{
 			log_error("Failed to start CREATE INDEX worker for index %s (%u), "
 					  "already being processed by pid %d",

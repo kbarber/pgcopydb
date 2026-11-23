@@ -58,6 +58,8 @@ typedef struct CopyDBOptions
 	int splitMaxParts;
 	bool estimateTableSizes;
 
+	int maxReplayAttempts;
+
 	RestoreOptions restoreOptions;
 
 	bool roles;

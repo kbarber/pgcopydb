@@ -60,6 +60,14 @@ static bool build_parameters_list(PQExpBuffer buffer,
 								  int paramCount,
 								  const char **paramValues);
 
+static bool pgsql_execute_with_params_once(PGSQL *pgsql, const char *sql,
+										   int paramCount,
+										   const Oid *paramTypes,
+										   const char **paramValues,
+										   void *context,
+										   ParsePostgresResultCB *parseFun,
+										   bool *isConnError);
+
 static bool pg_copy_data(PGSQL *src, PGSQL *dst,
 						 CopyArgs *args, CopyStats *stats,
 						 void *context, CopyStatsCallback *callback);
@@ -166,6 +174,35 @@ fetchedRows(void *ctx, PGresult *result)
 
 	context->parsedOk = true;
 	context->intVal = PQntuples(result);
+}
+
+
+/*
+ * Max reconnect-and-replay cycles per unit of work whose connection dropped
+ * mid-flight. Set once before any worker forks, read-only afterwards.
+ */
+static int pgsqlMaxReplayAttempts = DEFAULT_MAX_REPLAY_ATTEMPTS;
+
+
+/*
+ * pgsql_set_max_replay_attempts seeds the process-wide reconnect-and-replay
+ * ceiling. Call once at startup, before forking the clone workers.
+ */
+void
+pgsql_set_max_replay_attempts(int attempts)
+{
+	pgsqlMaxReplayAttempts = attempts;
+}
+
+
+/*
+ * pgsql_get_max_replay_attempts returns the process-wide reconnect-and-replay
+ * ceiling read by the worker retry loops.
+ */
+int
+pgsql_get_max_replay_attempts(void)
+{
+	return pgsqlMaxReplayAttempts;
 }
 
 
@@ -443,6 +480,19 @@ pgsql_finish(PGSQL *pgsql)
 					pgsql->safeURI.pguri);
 		}
 
+		/*
+		 * Remember a dropped/broken connection before we lose the handle: the
+		 * fetch/clear path finishes the connection on a reset, so the later
+		 * classify in the multi-statement replay loops would otherwise see a
+		 * NULL connection and no longer be able to tell a reset apart from a
+		 * clean close. pgsql_state_is_connection_error() reads this back.
+		 */
+		if (PQstatus(pgsql->connection) == CONNECTION_BAD ||
+			pgsql->status == PG_CONNECTION_BAD)
+		{
+			pgsql->connDropped = true;
+		}
+
 		PQfinish(pgsql->connection);
 		pgsql->connection = NULL;
 
@@ -619,6 +669,7 @@ pgsql_open_connection(PGSQL *pgsql)
 	INSTR_TIME_SET_CURRENT(pgsql->retryPolicy.connectTime);
 	pgsql->status = PG_CONNECTION_OK;
 	pgsql->sqlstate[0] = '\0';
+	pgsql->connDropped = false;
 
 	/* set the libpq notice receiver to integrate notifications as warnings. */
 	PQsetNoticeProcessor(pgsql->connection,
@@ -1522,6 +1573,62 @@ pgsql_execute(PGSQL *pgsql, const char *sql)
 
 /*
  * pgsql_execute_with_params implements running a SQL query using the libpq
+ * API. It wraps pgsql_execute_with_params_once with a reconnect-and-replay
+ * loop for single-statement connections: when the target (or source) tears the
+ * connection down mid-statement, libpq reports a class-08 / CONNECTION_BAD
+ * error that pgsql_state_is_connection_error() recognises, and we reopen (with
+ * the usual jittered backoff) and replay the statement. This is only safe in
+ * PGSQL_CONNECTION_SINGLE_STATEMENT mode: there is no open transaction to
+ * corrupt, and every single-statement call in clone is either idempotent or
+ * transactional DDL (CREATE INDEX, TRUNCATE, VACUUM, has_table_privilege, etc).
+ * Multi-statement work holds its connection for an explicit ROLLBACK and is
+ * restarted a whole transaction at a time by the owning worker instead.
+ */
+bool
+pgsql_execute_with_params(PGSQL *pgsql, const char *sql, int paramCount,
+						  const Oid *paramTypes, const char **paramValues,
+						  void *context, ParsePostgresResultCB *parseFun)
+{
+	bool singleStatement =
+		pgsql->connectionStatementType == PGSQL_CONNECTION_SINGLE_STATEMENT;
+
+	int maxReplayAttempts = pgsql_get_max_replay_attempts();
+
+	for (int attempts = 1; ; attempts++)
+	{
+		bool isConnError = false;
+
+		if (pgsql_execute_with_params_once(pgsql, sql, paramCount, paramTypes,
+										   paramValues, context, parseFun,
+										   &isConnError))
+		{
+			return true;
+		}
+
+		/*
+		 * Only replay a single-statement call whose connection dropped, and
+		 * only up to maxReplayAttempts times. A genuine SQL error (a permission
+		 * denial, a constraint violation) is not a connection error and must
+		 * fail immediately.
+		 */
+		if (!singleStatement ||
+			!isConnError ||
+			attempts > maxReplayAttempts)
+		{
+			return false;
+		}
+
+		log_warn("Connection to %s dropped mid-statement "
+				 "(attempt %d/%d); reconnecting and replaying",
+				 pgsql->connectionType == PGSQL_CONN_SOURCE ? "SOURCE" : "TARGET",
+				 attempts,
+				 maxReplayAttempts);
+	}
+}
+
+
+/*
+ * pgsql_execute_with_params_once implements running a SQL query using the libpq
  * API. This API requires very careful handling of responses and return values,
  * so we have a single implementation of that client-side parts of the Postgres
  * protocol.
@@ -1532,13 +1639,20 @@ pgsql_execute(PGSQL *pgsql, const char *sql)
  *
  * Finally, in some cases we want to avoid logging queries entirely: we might
  * be handling customer data so privacy rules apply.
+ *
+ * On failure, *isConnError reports whether the failure was a dropped/broken
+ * connection (class-08 / CONNECTION_BAD), classified before the connection is
+ * finished so the caller can decide whether to reconnect and replay.
  */
-bool
-pgsql_execute_with_params(PGSQL *pgsql, const char *sql, int paramCount,
-						  const Oid *paramTypes, const char **paramValues,
-						  void *context, ParsePostgresResultCB *parseFun)
+static bool
+pgsql_execute_with_params_once(PGSQL *pgsql, const char *sql, int paramCount,
+							   const Oid *paramTypes, const char **paramValues,
+							   void *context, ParsePostgresResultCB *parseFun,
+							   bool *isConnError)
 {
 	PQExpBuffer debugParameters = NULL;
+
+	*isConnError = false;
 
 	PGconn *connection = pgsql_open_connection(pgsql);
 
@@ -1645,6 +1759,14 @@ pgsql_execute_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 	{
 		pgsql_execute_log_error(pgsql, NULL, sql, debugParameters, context);
 		destroyPQExpBuffer(debugParameters);
+
+		/*
+		 * Classify the failure before finishing the connection: pgsql_finish
+		 * nulls out the connection that pgsql_state_is_connection_error()
+		 * inspects, so the caller's reconnect-and-replay decision must be made
+		 * here.
+		 */
+		*isConnError = pgsql_state_is_connection_error(pgsql);
 
 		/*
 		 * Multi statements might want to ROLLBACK and hold to the open
@@ -2630,9 +2752,19 @@ is_response_ok(PGresult *result)
 bool
 pgsql_state_is_connection_error(PGSQL *pgsql)
 {
-	return pgsql->connection != NULL &&
-		   (PQstatus(pgsql->connection) == CONNECTION_BAD ||
-			SQLSTATE_IS_CONNECTION_EXCEPTION(pgsql));
+	/*
+	 * When the connection is still open, classify it live. Once it has been
+	 * finished (the fetch/clear path closes it on a reset), fall back to the
+	 * sticky flag pgsql_finish() recorded: the multi-statement replay loops
+	 * classify after that close and would otherwise see only a NULL handle.
+	 */
+	if (pgsql->connection == NULL)
+	{
+		return pgsql->connDropped;
+	}
+
+	return PQstatus(pgsql->connection) == CONNECTION_BAD ||
+		   SQLSTATE_IS_CONNECTION_EXCEPTION(pgsql);
 }
 
 
@@ -3614,6 +3746,12 @@ pgsql_set_gucs(PGSQL *pgsql, GUC *settings)
  * identifier, the large object ownership is also restored on the target:
  * pgcopydb creates the large object itself via lo_create(), so the object is
  * initially owned by the connecting role.
+ *
+ * On error this leaves both connections open for the caller to inspect and
+ * recover: the worker owns their whole life (the source holds an exported
+ * snapshot that cannot be rebuilt here, and the target is replayed a batch at
+ * a time), so finishing them here would both destroy the snapshot and hide a
+ * dropped target connection from the caller's reconnect-and-replay decision.
  */
 bool
 pg_copy_large_object(PGSQL *src,
@@ -3659,8 +3797,6 @@ pg_copy_large_object(PGSQL *src,
 		{
 			log_error("Failed to delete large object %u", blobOid);
 
-			pgsql_finish(src);
-			pgsql_finish(dst);
 			return false;
 		}
 	}
@@ -3681,8 +3817,6 @@ pg_copy_large_object(PGSQL *src,
 			log_error("Failed to check existence of large object %u on target",
 					  blobOid);
 
-			pgsql_finish(src);
-			pgsql_finish(dst);
 			return false;
 		}
 
@@ -3739,8 +3873,6 @@ pg_copy_large_object(PGSQL *src,
 			{
 				log_error("Failed to delete empty large object %u", blobOid);
 
-				pgsql_finish(src);
-				pgsql_finish(dst);
 				return false;
 			}
 		}
@@ -3760,9 +3892,6 @@ pg_copy_large_object(PGSQL *src,
 
 		(void) pgcopy_log_error(dst, NULL, context);
 
-		pgsql_finish(src);
-		pgsql_finish(dst);
-
 		return false;
 	}
 
@@ -3779,9 +3908,6 @@ pg_copy_large_object(PGSQL *src,
 				"Failed to open large object %u", blobOid);
 
 		(void) pgcopy_log_error(src, NULL, context);
-
-		pgsql_finish(src);
-		pgsql_finish(dst);
 
 		return false;
 	}
@@ -3801,9 +3927,6 @@ pg_copy_large_object(PGSQL *src,
 		(void) pgcopy_log_error(dst, NULL, context);
 
 		lo_close(src->connection, srcfd);
-
-		pgsql_finish(src);
-		pgsql_finish(dst);
 
 		return false;
 	}
@@ -3830,9 +3953,6 @@ pg_copy_large_object(PGSQL *src,
 		lo_close(src->connection, srcfd);
 		lo_close(dst->connection, dstfd);
 
-		pgsql_finish(src);
-		pgsql_finish(dst);
-
 		return false;
 	}
 
@@ -3852,9 +3972,6 @@ pg_copy_large_object(PGSQL *src,
 			lo_close(src->connection, srcfd);
 			lo_close(dst->connection, dstfd);
 
-			pgsql_finish(src);
-			pgsql_finish(dst);
-
 			return false;
 		}
 
@@ -3872,9 +3989,6 @@ pg_copy_large_object(PGSQL *src,
 
 			lo_close(src->connection, srcfd);
 			lo_close(dst->connection, dstfd);
-
-			pgsql_finish(src);
-			pgsql_finish(dst);
 
 			return false;
 		}
@@ -3908,9 +4022,6 @@ pg_copy_large_object(PGSQL *src,
 			log_error("Failed to set owner of large object %u to %s",
 					  blobOid,
 					  rolname);
-
-			pgsql_finish(src);
-			pgsql_finish(dst);
 
 			return false;
 		}
